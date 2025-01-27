@@ -15,6 +15,8 @@ from selenium.common.exceptions import TimeoutException, NoAlertPresentException
 import threading
 import queue
 import re
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 
 load_dotenv()
 init(autoreset=True)  # Initialize colorama
@@ -251,43 +253,89 @@ Keep responses concise and focused on immediate next steps."""
     def _get_worker_action(self, task, worker_id):
         """Get specific action for a task"""
         try:
-            # Construct focused prompt based on task
-            system_prompt = f"""Focus on task: {task['task']}
-            Return ONE specific browser action as JSON:
-            1. {{"action":"click", "xpath":"element_xpath", "reason":"why"}}
-            2. {{"action":"type", "xpath":"input_xpath", "text":"text_to_type", "reason":"why"}}
-            3. {{"action":"navigate", "url":"target_url", "reason":"why"}}"""
+            # Check for direct site navigation in task
+            task_text = task['task'].lower()
+            
+            # More aggressive direct site matching
+            for site, url in self.automator.direct_sites.items():
+                # Check for various ways to reference the site
+                if any(pattern in task_text for pattern in [
+                    f"go to {site}",
+                    f"visit {site}",
+                    f"open {site}",
+                    f"search {site}",
+                    f"find {site}",
+                    site,  # Even just mentioning the site name
+                ]):
+                    return {
+                        "action": "navigate",
+                        "url": url,
+                        "reason": f"Direct navigation to {site} requested"
+                    }
+            
+            # Check if we're on a search engine and trying to search for a known site
+            current_url = self.automator.driver.current_url.lower()
+            if 'google.com' in current_url or 'search' in current_url:
+                for site, url in self.automator.direct_sites.items():
+                    if site in task_text:
+                        return {
+                            "action": "navigate",
+                            "url": url,
+                            "reason": f"Bypassing search to directly access {site}"
+                        }
 
-            state = {
-                "url": self.automator.driver.current_url,
-                "title": self.automator.driver.title,
-                "task": task,
-                "elements": self.automator.scan_page_elements()
-            }
+            # If no direct navigation, proceed with normal AI action generation with retry logic
+            max_retries = 3
+            retry_delay = 2
+            
+            for attempt in range(max_retries):
+                try:
+                    system_prompt = f"""Focus on task: {task['task']}
+                    Return ONE specific browser action as JSON:
+                    1. {{"action":"click", "xpath":"element_xpath", "reason":"why"}}
+                    2. {{"action":"type", "xpath":"input_xpath", "text":"text_to_type", "reason":"why"}}
+                    3. {{"action":"navigate", "url":"target_url", "reason":"why"}}"""
 
-            data = {
-                "model": "deepseek/deepseek-r1",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"State: {json.dumps(state, default=str)}"}
-                ],
-                "temperature": 0.2,
-                "response_format": {"type": "json_object"},
-                "max_tokens": 150
-            }
+                    state = {
+                        "url": self.automator.driver.current_url,
+                        "title": self.automator.driver.title,
+                        "task": task,
+                        "elements": self.automator.scan_page_elements()
+                    }
 
-            response = requests.post(
-                self.automator.api_url,
-                headers={"Authorization": f"Bearer {self.automator.api_key}"},
-                json=data,
-                timeout=(10, 30)
-            )
+                    data = {
+                        "model": "deepseek/deepseek-r1",
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": f"State: {json.dumps(state, default=str)}"}
+                        ],
+                        "temperature": 0.2,
+                        "response_format": {"type": "json_object"},
+                        "max_tokens": 150
+                    }
 
-            if response.status_code == 200:
-                content = response.json()['choices'][0]['message']['content']
-                action = json.loads(content)
-                if self.automator.validate_action(action):
-                    return action
+                    response = requests.post(
+                        self.automator.api_url,
+                        headers={"Authorization": f"Bearer {self.automator.api_key}"},
+                        json=data,
+                        timeout=(5, 15)  # Shorter timeouts
+                    )
+
+                    if response.status_code == 200:
+                        content = response.json()['choices'][0]['message']['content']
+                        action = json.loads(content)
+                        if self.automator.validate_action(action):
+                            return action
+                except requests.exceptions.Timeout:
+                    if attempt < max_retries - 1:
+                        self.automator.log_debug(f"API timeout, retrying ({attempt + 1}/{max_retries})", "WARNING")
+                        time.sleep(retry_delay)
+                    continue
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        self.automator.log_debug(f"API error: {str(e)}, retrying ({attempt + 1}/{max_retries})", "WARNING")
+                        time.sleep(retry_delay)
+                    continue
 
         except Exception as e:
             self.automator.log_debug(f"Worker {worker_id} action error: {str(e)}", "ERROR")
@@ -309,6 +357,18 @@ class BrowserAutomator:
         self.action_queue = queue.Queue()  # Queue for actions from AI threads
         self.ai_threads = []  # List to track AI threads
         self.brain = DeepseekBrain(self)
+        # Add direct navigation sites
+        self.direct_sites = {
+            'google': 'https://www.google.com',
+            'amazon': 'https://www.amazon.com',
+            'facebook': 'https://www.facebook.com',
+            'twitter': 'https://www.twitter.com',
+            'youtube': 'https://www.youtube.com',
+            'linkedin': 'https://www.linkedin.com',
+            'reddit': 'https://www.reddit.com',
+            'github': 'https://www.github.com',
+            'hipcamp': 'https://www.hipcamp.com/en-US'
+        }
         self.start_browser()
 
     def start_browser(self):
@@ -540,8 +600,6 @@ Active Threads: {len([t for t in self.ai_threads if t.is_alive()])}
             
             action_type = action['action']
             self.log_debug(f"Executing action: {action_type}", "ACTION")
-            self.log_debug(f"Current URL: {self.driver.current_url}", "DEBUG")
-            self.log_debug(f"Page Title: {self.driver.title}", "DEBUG")
 
             # Verify page is ready for interaction
             if not self.verify_page_ready():
@@ -556,261 +614,254 @@ Active Threads: {len([t for t in self.ai_threads if t.is_alive()])}
             # Add random delay before action
             time.sleep(random.uniform(0.5, 1.5))
             
-            if action_type == "click":
-                # Extract text to match from xpath or reason
-                base_xpath = action.get('xpath', '')
-                reason = action.get('reason', '').lower()
+            if action_type == "type":
+                text_to_type = action['text']
+                self.log_debug(f"Attempting to type: {text_to_type}", "DEBUG")
                 
-                # Build target text list from multiple sources
-                target_texts = []
-                if 'glamping' in base_xpath.lower():
-                    target_texts.append('glamping')
-                if 'glamp' in base_xpath.lower():
-                    target_texts.append('glamp')
-                if 'hipcamp' in base_xpath.lower():
-                    target_texts.append('hipcamp')
-                
-                # Extract any quoted text from reason
-                quoted = re.findall(r'"([^"]*)"', reason)
-                target_texts.extend(quoted)
-                
-                # More flexible XPath patterns with dynamic text matching
-                possible_xpaths = [base_xpath]  # Start with original XPath
-                
-                # Add dynamic XPaths for each target text
-                for text in target_texts:
-                    possible_xpaths.extend([
-                        f"//a[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{text}')]",
-                        f"//a[contains(@href, '{text}')]",
-                        f"//nav//a[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{text}')]",
-                        f"//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{text}')]",
-                        f"//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{text}')]",
-                        f"//a[contains(@href, 'search') and contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{text}')]"
-                    ])
-                
-                # Add general purpose selectors
-                possible_xpaths.extend([
-                    "//a[contains(@class, 'search-result')]",
-                    "//div[contains(@class, 'result')]//a",
-                    "//h3/parent::a",
-                    "//h3/following::a[1]"
-                ])
-                
-                self.log_debug(f"Attempting to click with {len(possible_xpaths)} XPath patterns", "DEBUG")
-                
-                found_elements = []
-                for xpath in possible_xpaths:
-                    try:
-                        elements = self.driver.find_elements(By.XPATH, xpath)
-                        for el in elements:
-                            try:
-                                if el.is_displayed():
-                                    found_elements.append({
-                                        "element": el,
-                                        "text": el.text.strip(),
-                                        "xpath": xpath
-                                    })
-                            except:
-                                continue
-                    except Exception as e:
-                        self.log_debug(f"XPath attempt failed: {xpath}", "DEBUG")
-                        continue
-                
-                if not found_elements:
-                    # Last resort - try finding any visible link containing target text
-                    try:
-                        links = self.driver.find_elements(By.TAG_NAME, "a")
-                        for link in links:
-                            try:
-                                if link.is_displayed():
-                                    link_text = link.text.lower()
-                                    if any(text.lower() in link_text for text in target_texts):
-                                        found_elements.append({
-                                            "element": link,
-                                            "text": link_text,
-                                            "xpath": "direct_search"
-                                        })
-                            except:
-                                continue
-                    except:
-                        pass
-                
-                if not found_elements:
-                    raise Exception(f"No clickable elements found matching: {', '.join(target_texts)}")
-                
-                # Sort elements by relevance (prefer elements with exact text match)
-                found_elements.sort(key=lambda x: sum(text.lower() in x["text"].lower() for text in target_texts), reverse=True)
-                
-                # Try clicking each element until success
-                for elem_info in found_elements:
-                    try:
-                        element = elem_info["element"]
-                        
-                        # Ensure element is still valid
-                        try:
-                            _ = element.is_enabled()
-                        except:
-                            continue
-                        
-                        # Scroll into view with retry
-                        scroll_attempts = 3
-                        for _ in range(scroll_attempts):
-                            try:
-                                # Smooth scroll with offset
-                                offset = random.randint(-100, 100)
-                                self.driver.execute_script(
-                                    """
-                                    arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});
-                                    window.scrollBy(0, arguments[1]);
-                                    """, 
-                                    element, 
-                                    offset
-                                )
-                                time.sleep(1)  # Wait for scroll to complete
-                                
-                                # Verify element is visible in viewport
-                                if self.driver.execute_script("""
-                                    var elem = arguments[0];
-                                    var rect = elem.getBoundingClientRect();
-                                    return (
-                                        rect.top >= 0 &&
-                                        rect.left >= 0 &&
-                                        rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) &&
-                                        rect.right <= (window.innerWidth || document.documentElement.clientWidth)
-                                    );
-                                    """, element):
-                                    break
-                            except:
-                                continue
-                        
-                        # Try multiple click methods with retry
-                        click_methods = [
-                            lambda: element.click(),
-                            lambda: self.driver.execute_script("arguments[0].click();", element),
-                            lambda: webdriver.ActionChains(self.driver).move_to_element(element).click().perform(),
-                            lambda: self.driver.execute_script(
-                                "arguments[0].dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));", 
-                                element
-                            )
-                        ]
-                        
-                        for click_method in click_methods:
-                            try:
-                                click_method()
-                                if self.verify_click_success():
-                                    self.log_debug(f"Click successful on: {elem_info['text'][:50]}", "DEBUG")
-                                    return True
-                            except Exception as e:
-                                self.log_debug(f"Click method failed: {str(e)}", "DEBUG")
-                                continue
-                            
-                            time.sleep(0.5)  # Brief pause between attempts
-                            
-                    except Exception as e:
-                        self.log_debug(f"Click attempt failed: {str(e)}", "DEBUG")
-                        continue
-                
-                raise Exception("All click attempts failed")
-
-            elif action_type == "type":
-                # Enhanced input field detection
-                possible_selectors = [
-                    (By.XPATH, action.get('xpath', '')),
-                    (By.NAME, "q"),  # Google search
-                    (By.XPATH, "//input[@type='text']"),
-                    (By.XPATH, "//input[@type='search']"),
-                    (By.XPATH, "//textarea[@type='search']"),
-                    (By.XPATH, "//textarea[@name='q']"),
-                    (By.CSS_SELECTOR, "[name='q']"),
-                    (By.CSS_SELECTOR, "[type='search']"),
-                    (By.CSS_SELECTOR, "[type='text']")
+                # Enhanced input selectors with priorities
+                input_selectors = [
+                    # High priority - specific IDs and names
+                    (By.ID, "twotabsearchtextbox", "Amazon main search"),
+                    (By.ID, "search", "Generic search box"),
+                    (By.NAME, "q", "Google/generic search"),
+                    (By.NAME, "field-keywords", "Amazon alternative"),
+                    (By.NAME, "search", "Generic search name"),
+                    
+                    # Medium priority - ARIA and role attributes
+                    (By.CSS_SELECTOR, "[role='searchbox']", "Search role"),
+                    (By.CSS_SELECTOR, "[aria-label*='search' i]", "Search aria-label"),
+                    (By.CSS_SELECTOR, "[placeholder*='search' i]", "Search placeholder"),
+                    
+                    # Lower priority - type attributes
+                    (By.CSS_SELECTOR, "[type='search']", "Search type"),
+                    (By.CSS_SELECTOR, "[type='text']", "Text type"),
+                    
+                    # Lowest priority - generic input tags
+                    (By.XPATH, "//input[@type='text']", "Generic text input"),
+                    (By.XPATH, "//input[@type='search']", "Generic search input"),
+                    (By.XPATH, action.get('xpath', ''), "Custom xpath")
                 ]
                 
                 element = None
-                for by, selector in possible_selectors:
+                wait = WebDriverWait(self.driver, 5)
+                
+                for by, selector, desc in input_selectors:
                     try:
-                        wait = WebDriverWait(self.driver, 3)
-                        element = wait.until(EC.presence_of_element_located((by, selector)))
-                        if element and element.is_displayed():
-                            self.log_debug(f"Found input element using: {by}={selector}", "DEBUG")
+                        # Try explicit wait first
+                        try:
+                            element = wait.until(EC.presence_of_element_located((by, selector)))
+                            if element.is_displayed() and element.is_enabled():
+                                self.log_debug(f"Found input using {desc}", "DEBUG")
+                                break
+                        except:
+                            # Fall back to find_elements
+                            elements = self.driver.find_elements(by, selector)
+                            for el in elements:
+                                if el.is_displayed() and el.is_enabled():
+                                    element = el
+                                    self.log_debug(f"Found input using {desc} (fallback)", "DEBUG")
+                                    break
+                        if element:
                             break
                     except:
                         continue
-                
+
                 if not element:
                     raise Exception("No input element found")
-                    
-                # Clear with retry
-                try:
-                    element.clear()
-                except:
-                    self.driver.execute_script("arguments[0].value = '';", element)
-                
-                # Type with human-like delays
-                text = action['text']
-                for char in text:
+
+                # Clear with multiple retry methods
+                clear_methods = [
+                    lambda: element.clear(),
+                    lambda: element.send_keys(Keys.CONTROL + "a" + Keys.DELETE),
+                    lambda: element.send_keys(Keys.COMMAND + "a" + Keys.DELETE),
+                    lambda: self.driver.execute_script("arguments[0].value = '';", element),
+                    lambda: ActionChains(self.driver).click(element).key_down(Keys.CONTROL).send_keys('a').key_up(Keys.CONTROL).send_keys(Keys.DELETE).perform()
+                ]
+
+                for clear_method in clear_methods:
                     try:
-                        element.send_keys(char)
-                        time.sleep(random.uniform(0.1, 0.3))
+                        clear_method()
+                        if not element.get_attribute('value'):
+                            break
                     except:
-                        self.driver.execute_script(f"arguments[0].value += '{char}';", element)
-                        time.sleep(random.uniform(0.1, 0.3))
-                
-                time.sleep(random.uniform(0.5, 1.0))
-                
-                # Press Enter with retry
-                try:
-                    element.send_keys(webdriver.Keys.RETURN)
-                except:
-                    self.driver.execute_script("arguments[0].form.submit();", element)
-                
+                        continue
+
+                # Type with human-like delays and verification
+                for char in text_to_type:
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            current_value = element.get_attribute('value')
+                            element.send_keys(char)
+                            time.sleep(random.uniform(0.05, 0.15))
+                            
+                            # Verify character was typed
+                            new_value = element.get_attribute('value')
+                            if len(new_value) > len(current_value):
+                                break
+                            
+                            # If not, try JavaScript
+                            if attempt == max_retries - 1:
+                                self.driver.execute_script(
+                                    f"arguments[0].value = arguments[1];", 
+                                    element, 
+                                    current_value + char
+                                )
+                        except:
+                            if attempt == max_retries - 1:
+                                self.driver.execute_script(
+                                    f"arguments[0].value += '{char}';", 
+                                    element
+                                )
+                            time.sleep(0.1)
+
+                # Enhanced search submission with multiple methods
+                submit_methods = [
+                    # Method 1: Press Enter key
+                    lambda: element.send_keys(Keys.RETURN),
+                    
+                    # Method 2: Look for and click search button
+                    lambda: self._click_search_button(),
+                    
+                    # Method 3: Form submit
+                    lambda: self.driver.execute_script("arguments[0].form.submit();", element),
+                    
+                    # Method 4: Synthesize Enter key event
+                    lambda: self.driver.execute_script("""
+                        var event = new KeyboardEvent('keydown', {
+                            'key': 'Enter',
+                            'code': 'Enter',
+                            'keyCode': 13,
+                            'which': 13,
+                            'bubbles': true
+                        });
+                        arguments[0].dispatchEvent(event);
+                    """, element)
+                ]
+
+                for submit_method in submit_methods:
+                    try:
+                        submit_method()
+                        time.sleep(1)
+                        if self._verify_search_submitted():
+                            return True
+                    except:
+                        continue
+
                 return True
 
-            elif action_type == "navigate":
-                target_url = action['url']
+            elif action_type == "click":
+                self.log_debug("Processing click action", "DEBUG")
                 
-                # Ensure proper Hipcamp URL format
-                if 'hipcamp.com' in target_url and '/en-US' not in target_url:
-                    target_url = target_url.replace('hipcamp.com', 'hipcamp.com/en-US')
+                # Get click target info
+                base_xpath = action.get('xpath', '')
+                reason = action.get('reason', '').lower()
                 
-                self.log_debug(f"Navigating to: {target_url}", "DEBUG")
+                # Enhanced text target extraction
+                target_texts = []
+                # Add quoted text from reason
+                quoted = re.findall(r'"([^"]*)"', reason)
+                target_texts.extend(quoted)
                 
-                try:
-                    self.driver.get(target_url)
-                    time.sleep(3)  # Wait longer for initial load
-                    
-                    # Verify we reached the correct domain
-                    current_url = self.driver.current_url
-                    if 'hipcamp.com' not in current_url:
-                        self.log_debug("Navigation failed to reach Hipcamp", "ERROR")
-                        # Try alternative URL
-                        alt_url = "https://www.hipcamp.com/en-US"
-                        self.log_debug(f"Trying alternative URL: {alt_url}", "DEBUG")
-                        self.driver.get(alt_url)
-                        time.sleep(3)
-                    
-                    # Final URL check
-                    if '404' in self.driver.current_url or 'error' in self.driver.current_url.lower():
-                        self.log_debug("Landed on error page, trying main site", "WARNING")
-                        self.driver.get("https://www.hipcamp.com/en-US")
-                        time.sleep(3)
-                    
-                    self.log_debug(f"Final navigation URL: {self.driver.current_url}", "DEBUG")
-                    return True
-                    
-                except Exception as e:
-                    self.log_debug(f"Navigation failed: {str(e)}", "ERROR")
-                    return False
+                # Extract key terms from reason
+                reason_words = reason.lower().split()
+                for word in reason_words:
+                    if len(word) > 3 and word not in ['click', 'button', 'link', 'the', 'and', 'for']:
+                        target_texts.append(word)
+                
+                # Add common button text based on context
+                if any(term in reason.lower() for term in ['search', 'find', 'look']):
+                    target_texts.extend(['search', 'go', 'find', 'submit'])
+                if any(term in reason.lower() for term in ['submit', 'send', 'confirm']):
+                    target_texts.extend(['submit', 'send', 'confirm', 'ok', 'yes'])
+                if any(term in reason.lower() for term in ['next', 'continue']):
+                    target_texts.extend(['next', 'continue', 'proceed'])
+                
+                # Build comprehensive xpath list with priorities
+                possible_xpaths = []
+                
+                # High priority: Exact matches with button/input elements
+                for text in target_texts:
+                    possible_xpaths.extend([
+                        f"//button[normalize-space(.)='{text}']",
+                        f"//input[@type='submit' and @value='{text}']",
+                        f"//input[@type='button' and @value='{text}']"
+                    ])
+                
+                # Medium priority: Contains matches with various elements
+                for text in target_texts:
+                    possible_xpaths.extend([
+                        f"//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{text}')]",
+                        f"//input[@type='submit' and contains(translate(@value, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{text}')]",
+                        f"//a[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{text}')]",
+                        f"//*[@role='button' and contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{text}')]",
+                        f"//*[contains(@aria-label, '{text}')]",
+                        f"//*[contains(@title, '{text}')]",
+                        f"//*[contains(@data-testid, '{text}')]",
+                        f"//*[contains(@id, '{text}')]",
+                        f"//*[contains(@name, '{text}')]"
+                    ])
+                
+                # Add the original xpath if provided
+                if base_xpath:
+                    possible_xpaths.insert(0, base_xpath)
+                
+                # Add common interactive elements
+                possible_xpaths.extend([
+                    "//button[@type='submit']",
+                    "//input[@type='submit']",
+                    "//*[@role='button']",
+                    "//*[contains(@class, 'button')]",
+                    "//*[contains(@class, 'btn')]",
+                    "//button[last()]"  # Sometimes the last button is the submit button
+                ])
+                
+                # Try each xpath with improved interaction
+                wait = WebDriverWait(self.driver, 5)
+                
+                for xpath in possible_xpaths:
+                    try:
+                        # Try explicit wait first
+                        try:
+                            element = wait.until(EC.presence_of_element_located((By.XPATH, xpath)))
+                            if element.is_displayed() and element.is_enabled():
+                                if self._try_click_element(element):
+                                    return True
+                        except:
+                            # Fall back to find_elements
+                            elements = self.driver.find_elements(By.XPATH, xpath)
+                            for element in elements:
+                                if element.is_displayed() and element.is_enabled():
+                                    if self._try_click_element(element):
+                                        return True
+                    except:
+                        continue
+                
+                raise Exception("No clickable element found")
 
-            elif action_type == "wait":
-                time.sleep(action['seconds'])
+            elif action_type == "navigate":
+                target_url = action['url'].lower()
+                # Extract domain from URL or use full URL
+                domain = target_url.replace('http://', '').replace('https://', '').split('/')[0].split('.')[0]
                 
-            elif action_type == "scroll":
-                scroll_amount = random.randint(300, 700)
-                self.driver.execute_script(
-                    "window.scrollBy({top: arguments[0], left: 0, behavior: 'smooth'});", 
-                    scroll_amount
-                )
+                # Check if this is a direct navigation site
+                if domain in self.direct_sites:
+                    self.log_debug(f"Direct navigation to {domain}", "INFO")
+                    try:
+                        self.driver.get(self.direct_sites[domain])
+                        time.sleep(2)
+                        return True
+                    except Exception as e:
+                        self.log_debug(f"Direct navigation failed: {str(e)}", "ERROR")
+                        return False
+                else:
+                    try:
+                        self.driver.get(target_url)
+                        time.sleep(2)
+                        return True
+                    except Exception as e:
+                        self.log_debug(f"Navigation failed: {str(e)}", "ERROR")
+                        return False
 
             return True
         
@@ -818,6 +869,136 @@ Active Threads: {len([t for t in self.ai_threads if t.is_alive()])}
             self.log_debug(f"Action failed: {str(e)}", "ERROR")
             self.log_debug(f"Full error: {traceback.format_exc()}", "DEBUG")
             return False
+
+    def _try_click_element(self, element):
+        """Helper method for robust element clicking"""
+        try:
+            # Scroll into view with center alignment
+            self.driver.execute_script("""
+                arguments[0].scrollIntoView({
+                    behavior: 'smooth',
+                    block: 'center',
+                    inline: 'center'
+                });
+            """, element)
+            time.sleep(0.5)
+            
+            # Ensure element is in viewport
+            viewport_script = """
+                var rect = arguments[0].getBoundingClientRect();
+                return (
+                    rect.top >= 0 &&
+                    rect.left >= 0 &&
+                    rect.bottom <= (window.innerHeight || document.documentElement.clientHeight) &&
+                    rect.right <= (window.innerWidth || document.documentElement.clientWidth)
+                );
+            """
+            
+            if not self.driver.execute_script(viewport_script, element):
+                # If not in viewport, try scrolling with offset
+                self.driver.execute_script("window.scrollBy(0, arguments[0]);", random.randint(-100, 100))
+                time.sleep(0.5)
+            
+            # Multiple click methods with verification
+            click_methods = [
+                # Standard click
+                lambda: element.click(),
+                
+                # JavaScript click
+                lambda: self.driver.execute_script("arguments[0].click();", element),
+                
+                # Action chains click
+                lambda: ActionChains(self.driver).move_to_element(element).click().perform(),
+                
+                # JavaScript event dispatch
+                lambda: self.driver.execute_script("""
+                    var event = new MouseEvent('click', {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window
+                    });
+                    arguments[0].dispatchEvent(event);
+                """, element),
+                
+                # Focus and Enter key
+                lambda: (element.send_keys(Keys.RETURN) if element.is_displayed() and element.is_enabled() else None),
+                
+                # Double click (some elements require this)
+                lambda: ActionChains(self.driver).double_click(element).perform()
+            ]
+            
+            for click_method in click_methods:
+                try:
+                    click_method()
+                    time.sleep(0.5)
+                    if self.verify_click_success():
+                        return True
+                except:
+                    continue
+            
+            return False
+            
+        except Exception as e:
+            self.log_debug(f"Click attempt failed: {str(e)}", "DEBUG")
+            return False
+
+    def _verify_search_submitted(self):
+        """Verify if a search was successfully submitted"""
+        try:
+            # Store initial state
+            initial_url = self.driver.current_url
+            
+            # Wait briefly for changes
+            time.sleep(1)
+            
+            # Check for URL change
+            if self.driver.current_url != initial_url:
+                return True
+            
+            # Check for loading indicators
+            loading_indicators = [
+                "//div[contains(@class, 'loading')]",
+                "//div[contains(@class, 'spinner')]",
+                "//div[contains(@class, 'progress')]",
+                "//div[contains(@class, 'searching')]",
+                "//div[contains(@class, 'results')]"
+            ]
+            
+            for indicator in loading_indicators:
+                try:
+                    elements = self.driver.find_elements(By.XPATH, indicator)
+                    if any(el.is_displayed() for el in elements):
+                        return True
+                except:
+                    continue
+            
+            return False
+            
+        except Exception as e:
+            self.log_debug(f"Search verification error: {str(e)}", "DEBUG")
+            return False
+
+    def _click_search_button(self):
+        """Helper method to find and click search button"""
+        search_button_selectors = [
+            (By.XPATH, "//button[@type='submit']"),
+            (By.XPATH, "//input[@type='submit']"),
+            (By.XPATH, "//button[contains(@class, 'search')]"),
+            (By.XPATH, "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'search')]"),
+            (By.CSS_SELECTOR, "[aria-label*='search' i]"),
+            (By.CSS_SELECTOR, "[title*='search' i]")
+        ]
+        
+        for by, selector in search_button_selectors:
+            try:
+                elements = self.driver.find_elements(by, selector)
+                for element in elements:
+                    if element.is_displayed() and element.is_enabled():
+                        return self._try_click_element(element)
+            except:
+                continue
+        
+        return False
 
     def verify_click_success(self):
         """Verify if click action had an effect"""
