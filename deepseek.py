@@ -32,6 +32,9 @@ class DeepseekBrain:
         self.running = False
         self.last_assessment = None
         self.current_strategy = None
+        self.last_action_type = None  # Track last action type
+        self.last_action_time = 0  # Track when last action was executed
+        self.consecutive_same_actions = 0  # Track repeated actions
 
     def start(self):
         """Start the brain coordinator"""
@@ -167,8 +170,10 @@ Keep responses concise and focused on immediate next steps."""
             try:
                 current_time = time.time()
                 
-                # Only assess periodically
-                if current_time - last_assessment >= assessment_interval:
+                # Only assess periodically and if no recent action was successful
+                if (current_time - last_assessment >= assessment_interval and 
+                    current_time - self.last_action_time >= 5):  # Wait at least 5 seconds after last action
+                    
                     self.automator.log_debug("Brain performing strategic assessment...", "INFO")
                     strategy = self._assess_situation()
                     if strategy:
@@ -179,11 +184,17 @@ Keep responses concise and focused on immediate next steps."""
                         # Create tasks based on priority areas
                         for task in strategy.get('priority_tasks', []):
                             if isinstance(task, str):  # Validate task format
+                                # Don't add redundant navigation tasks
+                                if ('navigate' in task.lower() and 
+                                    self.last_action_type == 'navigate' and 
+                                    current_time - self.last_action_time < 10):
+                                    continue
+                                    
                                 self.task_queue.put({
                                     "task": task,
                                     "focus": strategy.get('focus_areas', []),
                                     "timestamp": current_time,
-                                    "assessment_id": int(current_time)  # Track which assessment created this task
+                                    "assessment_id": int(current_time)
                                 })
                                 self.automator.log_debug(f"Added task: {task}", "DEBUG")
                     
@@ -256,6 +267,12 @@ Keep responses concise and focused on immediate next steps."""
             # Check for direct site navigation in task
             task_text = task['task'].lower()
             
+            # Don't repeat the same navigation action too quickly
+            current_time = time.time()
+            if (self.last_action_type == 'navigate' and 
+                current_time - self.last_action_time < 5):
+                return None
+            
             # More aggressive direct site matching
             for site, url in self.automator.direct_sites.items():
                 # Check for various ways to reference the site
@@ -267,26 +284,23 @@ Keep responses concise and focused on immediate next steps."""
                     f"find {site}",
                     site,  # Even just mentioning the site name
                 ]):
-                    return {
+                    # Check if we're already on this site
+                    current_url = self.automator.driver.current_url.lower()
+                    if site in current_url:
+                        return None
+                        
+                    action = {
                         "action": "navigate",
                         "url": url,
                         "reason": f"Direct navigation to {site} requested"
                     }
-            
-            # Check if we're on a search engine and trying to search for a known site
-            current_url = self.automator.driver.current_url.lower()
-            if 'google.com' in current_url or 'search' in current_url:
-                for site, url in self.automator.direct_sites.items():
-                    if site in task_text:
-                        return {
-                            "action": "navigate",
-                            "url": url,
-                            "reason": f"Bypassing search to directly access {site}"
-                        }
+                    self.last_action_type = 'navigate'
+                    self.last_action_time = current_time
+                    return action
 
-            # If no direct navigation, proceed with normal AI action generation with retry logic
-            max_retries = 3
-            retry_delay = 2
+            # If no direct navigation, proceed with normal AI action generation
+            max_retries = 2  # Reduced retries
+            retry_delay = 1  # Shorter delay
             
             for attempt in range(max_retries):
                 try:
@@ -318,13 +332,16 @@ Keep responses concise and focused on immediate next steps."""
                         self.automator.api_url,
                         headers={"Authorization": f"Bearer {self.automator.api_key}"},
                         json=data,
-                        timeout=(5, 15)  # Shorter timeouts
+                        timeout=(3, 10)  # Even shorter timeouts
                     )
 
                     if response.status_code == 200:
                         content = response.json()['choices'][0]['message']['content']
                         action = json.loads(content)
                         if self.automator.validate_action(action):
+                            # Track action type and time
+                            self.last_action_type = action['action']
+                            self.last_action_time = current_time
                             return action
                 except requests.exceptions.Timeout:
                     if attempt < max_retries - 1:
